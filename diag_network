@@ -1,0 +1,900 @@
+#!/usr/bin/perl
+#  Copyright (C) 2013 eNovance SAS <licensing@enovance.com>
+#  Author: Erwan Velu  <erwan@enovance.com>
+#
+#  The license below covers all files distributed with fio unless otherwise
+#  noted in the file itself.
+#
+#  This program is free software; you can redistribute it and/or modify
+#  it under the terms of the GNU General Public License version 2 as
+#  published by the Free Software Foundation.
+#
+#  This program is distributed in the hope that it will be useful,
+#  but WITHOUT ANY WARRANTY; without even the implied warranty of
+#  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#  GNU General Public License for more details.
+#
+#  You should have received a copy of the GNU General Public License
+#  along with this program; if not, write to the Free Software
+#  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+#
+#
+# A tool to stat network performances
+#
+#
+use Getopt::Long;
+
+my $DEFAULT_SOCKET_SIZE=131072;
+my $NETPIPE_BENCHMARK_OPTIONS="-n 18 -I";
+my $NETPIPE_INTEGRITY_OPTIONS="-i -n 5";
+my $NETPIPE_NB_RUN=43; #Netpipe runs 43 integrity tests
+my $NETPIPE="/usr/bin/NPtcp";
+my $NETPERF_CLIENT="/usr/bin/netperf";
+my $NETPERF_TIME_TO_RUN="15"; #Test's duration
+#Report Cpu Usage for both side, using Megabits units
+my $NETPERF_CLIENT_OPTIONS="-Cc -f m";
+my $NETPERF_SERVER="/usr/bin/netserver";
+my $NETPERF_PORT_BASE="21600";
+my $KASH="/usr/bin/kash";
+my $CPUBURN_TEST="/usr/bin/burnP6";
+my %netperf_port=();
+my $cpuburn_option="";
+my $cpuburn_text="";
+my $no_integrity=0;
+my $hostname;
+my $perl_compat_mode=0; #sprintf is buggy on perl 5.8.0
+my $netpipe_socket_option = "";
+my @arg_nodes_list;
+
+# Dispaly errors
+sub error {
+    my $i = 1;
+    foreach my $msg (@_) {
+        print STDERR ($i++ == 1 ? "ERROR:" : "      "), " ${msg}\n";
+    }
+}
+
+sub get_nodes_cmdline {
+    my $result="";
+    foreach $nodes (map { "$_" } @arg_nodes_list) {
+	    $result="$result -n \\\"$nodes\\\"";
+    }
+    return $result;
+}
+
+#Generate the cmdline needed by rshp
+sub generate_kash_cmdline {
+    my @nodes=@_;
+    my $cmdline="";
+    foreach my $node (@nodes) {
+	$cmdline .= " -n $node";
+    }
+    $cmdline .= " --";
+}
+
+#Some stats take from Statistics-Lite perl module
+sub sum
+{
+    return unless @_;
+    return $_[0] unless @_ > 1;
+    my $sum;
+    foreach(@_) { $sum+= $_; }
+    return $sum;
+}
+
+sub mean
+{
+    return unless @_;
+    return $_[0] unless @_ > 1;
+    return sum(@_)/scalar(@_);
+}
+
+sub variance
+{
+    return unless @_;
+    return 0 unless @_ > 1;
+    my $mean= mean @_;
+    return mean map { ($_ - $mean)**2 } @_;
+}
+
+sub stddev
+{
+    return unless @_;
+    return 0 unless @_ > 1;
+    return sqrt variance @_;
+}
+
+#Checking that we can ssh the node
+#Checking also that the mcast testing tool is available on all nodes
+sub check_ssh_permissions {
+    my $binary=shift;
+    my @node_list = @_;
+    my $error_code=0;
+    print "Checking ssh configuration & permissions for $binary\n";
+    foreach my $node (@node_list) {
+        my $etat=system("unset DISPLAY \&\& ssh root\@$node \"test -x $binary\"");
+        if ($etat > 0) {
+            if ($etat == 65280 ) {
+                &error("It is impossible to ssh root\@$node", "Please check the sshd configuration on $node");
+                $error_code++;
+            } elsif ($etat == 256 ) {
+                &error("$binary is not available or not executable on $node","Please install it or check permissions of $binary on $node");
+                $error_code++;
+            } else {
+                &error("It is impossible to ssh $node","Unknow error n°$etat");
+                $error_code++;
+            }
+        }
+    }
+
+    if ($error_code >0 ) {
+        &error("Exiting");
+        exit 1;
+    }
+
+}
+
+#------------------------------------------------------------
+
+#
+# Given a node name parameter that includes regexp style node numbering.
+# returns a list of nodes.
+# Nodes are returned in the parsed order, not sorted.
+#
+# The numbering format is:
+# NODES       ::= {<NODEREG>}
+# NODEREG     ::= NODEPREFIX{<NUMBERING>}{<NODEREG>}
+# <NUMBERING> ::= <digit> { [-<digit>] | [:] }
+#
+# Example:
+# node/1-4/          => node1 node2 node3 node4
+# node/1-4/ node10    => node1 node2 node3 node4 node10
+# node/3:8-9/ node1   => node3 node8 node9 node1
+# node-/3-5:7:10-12/ => node-3 node-4 node-5 node-7 node-10 node-11 node-12
+#
+# Example with multiple ranges:
+# node/1-2/-/3-4/    => node1-3 node1-4 node2-3 node2-4
+#
+# If a * is passed in all_nodes, nothing is done, the * is returned.
+#
+# \returns a list of nodes.
+#
+sub name_expand($) {
+    my $all_nodes    = shift;
+
+    if($all_nodes eq "*") {
+	return "*";
+    }
+
+    my @result;
+
+    $all_nodes =~ s/[ ]+/ /g;
+    my @nodes_list = split(/ /, $all_nodes);
+
+    foreach my $nodes (@nodes_list) {
+	# Is there really a regexp there. If not, push the current node in the result stack
+	if($nodes !~ /\/\d+[0-9:-]*\d*\//) {
+	    push(@result, "$nodes");
+	} else {
+	    # Extract the prefix
+	    my ($node_name, $node_expr, $remaining) = $nodes =~ /^(.*?)(\/\d+[0-9:-]*\/)+?(.*)/;
+
+	    # Remove the //
+	    $node_expr =~ s/\///g;
+
+	    my @expr_numbers = split(/[:-]/,$node_expr);
+
+	    my @expr_expr    = split(/[0-9]+/,$node_expr);
+	    my $lost = shift(@expr_expr);
+
+	    my $previous = -1;
+	    foreach my $number (@expr_numbers) {
+		my $expr = shift(@expr_expr);
+		if (!defined($expr)) {
+		    $expr = ":";
+		}
+
+		if ($expr eq ":") {
+		    my $format = "%d";
+
+		    # Detect if leading 0 are needed and how much
+		    my @lprevious = split("", $previous);
+		    if(($lprevious[0] eq 0) && length($previous)>1) {
+			$format = "%0" . length($previous) . "d";
+		    }
+
+		    my @lnumber = split("", $number);
+		    if(($lnumber[0] eq 0) && length($number)>1) {
+			$format = "%0" . length($number) . "d";
+		    }
+
+		    if ($previous != -1) {
+			for (my $i = $previous ; $i <= $number ; $i++) {
+			    # Recursively create an expansion if remaining regexp
+			    if($remaining =~ /\//) {
+				my @subnames = &name_expand("$remaining");
+				foreach my $subname (@subnames) {
+				    push(@result, "$node_name" . sprintf("$format", $i) . "$subname");
+				}
+			    } else {
+				push(@result, "$node_name" . sprintf("$format", $i) . "$remaining");
+			    }
+			}
+			$previous = -1;
+		    } else {
+			# Recursively create an expansion if remaining regexp
+			if($remaining =~ /\//) {
+			    my @subnames = &name_expand("$remaining");
+			    foreach my $subname (@subnames) {
+				push(@result, "$node_name" . sprintf("$format", $number) . "$subname");
+			    }
+			} else {
+			    push(@result, "$node_name" . sprintf("$format", $number) . "$remaining");
+			}
+		    }
+		} elsif ($expr eq "-") {
+		    if ($previous != -1) {
+			push(@result, "${node_name}/${node_expr}/${remaining}");
+			$previous = -1;
+			@expr_numbers = qw//;
+		    } else {
+			$previous = $number;
+		    }
+		} else {
+		    push(@result, "${node_name}/${node_expr}/${remaining}");
+		    @expr_numbers = qw//;
+		}
+	    }
+	}
+    }
+
+    # PDEBUG("===> Name expand: got $all_nodes, returning @result\n");
+    return @result;
+}
+
+# Kill remaining process
+sub clean_netpipe_clients {
+    my $node1 = shift;
+    my $node2 = shift;
+    print("C");
+    system("ps -A | grep NPtcp | grep ssh | awk \'{print \$1}\' | xargs kill -9",">/dev/null 2>&1");
+    print(":");
+}
+
+# Convert textual size in byte size
+# like "128K" in "131072"
+sub find_byte_size
+{
+    my $textual_size=shift;
+    my ($size,$unit) = $textual_size =~ /\s*(\d+)(\S*)/;
+    if    ($unit eq "k") { return $size * 1000; }
+    elsif ($unit eq "m") { return $size * 1000*1000; }
+    elsif ($unit eq "g") { return $size * 1000*1000*1000; }
+    elsif ($unit eq "K") { return $size * 1024; }
+    elsif ($unit eq "H") { return $size * 1024*1024; }
+    elsif ($unit eq "G") { return ($size * 1024*1024*1024); }
+    else { return $textual_size; }
+}
+
+
+#Prepare command line options for netpipe
+sub compute_netpipe_options {
+
+    if ($options{"socket"}) {
+        my $socket_size=&find_byte_size($options{"socket"});
+        $socket_text=": Socket size = " . $options{"socket"};
+        $netpipe_socket_option="-b $socket_size" ;
+    } else {
+
+        $netpipe_socket_option="-b  $DEFAULT_SOCKET_SIZE" ;
+    }
+
+    if ($options{"packet"}) {
+        my $packet_size=&find_byte_size($options{"packet"});
+        $socket_text.=": Packet size = " . $options{"socket"};
+        $netpipe_socket_option.=" -u $packet_size -l $packet_size" ;
+    } else {
+        $netpipe_socket_option.=" -u $DEFAULT_SOCKET_SIZE -l $DEFAULT_SOCKET_SIZE" ;
+    }
+
+    if (! $options{bidirect}) {
+	$NETPIPE_BENCHMARK_OPTIONS .= " -s";
+    }
+}
+
+# Netpipe Benchmark procedure
+sub bench_netpipe {
+    my $node_from     = shift;
+    my $node_to       = shift;
+    my $bp	      = 0;
+    # Run the block_bench tool on a host
+    close(STDERR);
+    print("R");
+    open(SSH,"ssh $node_from \"$NETPIPE $netpipe_socket_option $NETPIPE_BENCHMARK_OPTIONS -h $node_to \" 2>&1 |");
+    while (<SSH>) {
+	my ($temp_bp) = $_ =~ /\s*1:.*\-\-\>\s*(\d+).*/;
+	if ($temp_bp > 0) {
+		$bp=$temp_bp;
+	}
+    }
+    #&clean_netpipe_clients;
+    return $bp;
+}
+
+# Integrity test procedure between two nodes
+sub check_integrity {
+    my $node_from   = shift;
+    my $node_to     = shift;
+    my $success	    = 0;
+    my $nb_succeed  = 0;
+    return if ($no_integrity == 1);
+    # Run the block_bench tool on a host
+    close(STDERR);
+    print("I");
+    open(SSH,"ssh $node_to $NETPIPE $NETPIPE_INTEGRITY_OPTIONS 2>&1 & sleep 1 && ssh $node_from $NETPIPE $NETPIPE_INTEGRITY_OPTIONS -h $node_to 2>&1 |");
+    while (<SSH>) {
+	print $_ if ($options{debug});
+	my ($line_number,$block_size,$nb_times,$test_result) = $_ =~ /\s*(\d+):\s*(\d+) bytes\s*(\d+) times\s*\-\-\> (.*)/;
+	if ($block_size>0) {
+	    if ($test_result != "Integrity check passed") {
+	    	print ("\nTest n°$line_number ($block_size Bytes) failed with :$test_result");
+	    	$success=0;
+	    } else {
+		$nb_succeed++;
+	    }
+	}
+    }
+
+    $success = 1 if ($nb_succeed == $NETPIPE_NB_RUN);
+    return $success;
+}
+
+sub check_netpipe {
+    my $node = shift;
+    print ".";
+    $result=`ssh $node which $NETPIPE >/dev/null 2>&1; echo \$?`;
+}
+
+
+sub usage {
+    print <<EOF;
+
+    diag_network
+	Runs a network bench on a set of nodes
+
+	Usage : diag_network -n nodes [OPTIONS]
+	Common options:
+	-n, --nodes		Select a set of nodes
+	-s, --storm		Using storm mode (all nodes tries to communicate with all other nodes)
+	-S, --socket		Define the buffer size of the socket (units could be k,m,g(^10) or K,M,G(^2)
+	-P, --packet		Define the size of packets to send (units could be k,m,g(^10) or K,M,G(^2)
+		    		By default the packet size equals the socket size
+	-i, --no_integrity	Don't do the integrity checking
+	-t, --time		Define the time the storm bench duration (Only available in storm mode)
+	-b, --bidirect		Make a bi-directional network test (NOT available in storm mode)
+	-c, --cpuburn		Start the test under a high cpu load (cpuburn)
+	-o, --outputfile	Select the outputfile, it could be used by gnuplot (i.e diag_network.output)
+
+Examples:
+	diag_network -n node/1-6/ 
+	#Testing all the network links between nodes node1,node2,node3,node4,node5,node6
+	
+	diag_network -n node/1-6/ -s --socket 128k
+	#Testing the nodes node/1-6/ by runnin the storm mode with a socket size of 128000 Bytes
+EOF
+	exit 1;
+}
+
+# Run a netpipe bench between two nodes
+sub run_netpipe_bench {
+    my @nodes=@_;
+    my $num_node_from=0;
+    my $num_node_to=0;
+    my @results;
+
+    &start_cpuburn_nodes(@nodes) if ($options{cpuburn});
+    &compute_netpipe_options;
+    foreach $mynode_from (@nodes) {
+	$num_node_from++;
+	$num_node_to=0;
+    	&start_netpipe_daemon(@nodes);
+	foreach $mynode_to (@nodes) {
+	    $num_node_to++;
+	    next if $mynode_to eq $mynode_from;
+	    print ("Testing bandwidth between $mynode_from and $mynode_to :");
+
+	    my $bp = &bench_netpipe($mynode_from,$mynode_to);
+	    push @results,$bp;
+	    my $integrity=&check_integrity($mynode_from,$mynode_to);
+	    print(" $bp Mbps");
+
+	    if ($options{outputfile}) {
+		print OUTPUTFILE "$num_node_from $num_node_to $bp\n";
+	    }
+
+	    if ($integrity)	{
+		print ": Integrity OK";
+	    }
+
+	    print ("\n");
+
+	}
+	if ($options{outputfile}) {
+	    print OUTPUTFILE "\n";
+	}                           # print the bandwidth
+
+    }
+    &stop_netpipe_daemon(@nodes);
+    &stop_cpuburn_nodes(@nodes) if ($options{cpuburn});
+    print  ("-\n");
+    print  ("Stats:\n");
+    printf ("Average bandwidth / host          : %7.2f Mbps\n",&mean(@results));
+    printf ("Standard deviation between hosts  : %7.2f Mbps\n",&stddev(@results));
+}
+
+# Stopping the netperf servers
+sub stop_netperf_servers {
+    my @nodes=@_;
+    print "Stopping netperf servers\n";
+    foreach my $node (@nodes) {
+	system("ssh $node \"killall -9 $NETPERF_SERVER\ >/dev/null 2>&1\"");
+    }
+}
+
+# Starting on each host a dedicated server for each other node
+# Each node will have serveral netperf servers running on a different port
+sub start_netperf_servers{
+    my @nodes=@_;
+    foreach my $node (@nodes) {
+	print "Starting netperf servers on $node for";
+	system("ssh $node \"killall -9 $NETPERF_SERVER\ >/dev/null 2>&1\"");
+	foreach my $other_node (grep { $_ ne $node } @nodes) {
+	    print (" $other_node");
+	    my $cmdline="$NETPERF_SERVER -n \`/usr/bin/getconf _NPROCESSORS_ONLN\` -p $netperf_port{$other_node}";
+	    system("ssh $node \'nohup $cmdline >/dev/null 2>&1\'");
+#			my $status=system("ssh $node \"ps ax | grep -v grep | grep \\\"$cmdline\\\" \">/dev/null 2>&1");
+#			if ($status != 0) {
+#				print("\n");
+#				&error("$status: The netperf server for $other_node($netperf_port{$other_node}) is not running !\"");
+#				return 0;
+#			}
+	}
+	print"\n";
+    }
+    return 1;
+}
+
+# Starting netperf clients on all nodes
+sub start_netperf_clients{
+    my @nodes=@_;
+    my %results=();
+    my @global_results;
+    my @all_streams;
+    my @all_local_cpu;
+    my %performances=();
+    my %remote_cpu_load=();
+    my $debug_option="";
+    my $socket_option="";
+    my $socket_text="";
+    my $nb_streams=0;
+    my $cmdline=&generate_kash_cmdline(@nodes);
+
+    $debug_option="-d" if ($options{debug});
+    if ($options{"socket"}) {
+	$socket_text=": Socket size = " . $options{"socket"};
+	$socket_option="--socket " . $options{"socket"};
+	}
+
+    if ($options{packet}) {
+	$socket_text .=": Packet size = " . $options{packet};
+	$socket_option .=" --packet " . $options{packet};
+	}
+
+    print "Starting benchmark$cpuburn_text $socket_text\n";
+    print "Please wait for $NETPERF_TIME_TO_RUN seconds\n";
+    &start_cpuburn_nodes(@nodes) if ($options{cpuburn});
+
+    # print "$KASH $cmdline diag_network -t $NETPERF_TIME_TO_RUN -i -s $cpuburn_option $socket_$option $debug_option " . &get_nodes_cmdline ." 2>&1 |\n";
+#    Using KASH to insure that all nodes will start a the same time
+    open(KASH,"$KASH $cmdline diag_network -t $NETPERF_TIME_TO_RUN --clientstorm -s $cpuburn_option $socket_option $debug_option ". &get_nodes_cmdline ." 2>&1 |");
+    while (<KASH>) {
+	print $_ if ($options{debug});
+	if ($_ =~/\s*ERROR:.*/) {
+	    print ("-\n");
+	    print ("The following error occured ! \n");
+	    print ($_);
+	    $nb_streams=0; # We can't trust the results, so we consider all tests are weaked
+	    #We are in error, insure that cpuburn is stopped
+	    last;	       # Exiting the current while, it will stop the kash exec
+	}
+	if (($node,$perfs) = $_ =~ /(.*):\s*Individual\s*results\s*:(.*)/) {
+	    $performances{$node}=$perfs;
+	    push @all_streams,$perfs;
+	    $nb_streams+=split(/ /,$perfs)-1;
+	    $results{$node}=&sum(split(/ /,$perfs));
+	    push @global_results,&sum(split(/ /,$perfs));
+	}
+	if (($node,$cpu_local_load) = $_ =~ /(.*):\s*Local\s*CPU\s*Load\s*\(\%\)\s*:(.*)/) {
+	    $remote_local_load{$node}=$cpu_local_load;
+	    push @all_local_cpu,$cpu_local_load;
+	    $results_local_cpu{$node}=$cpu_local_load;
+	}
+
+    }
+    close(KASH);
+    &stop_cpuburn_nodes(@nodes) if ($options{cpuburn});
+
+    if (keys(%performances)==0 ||  $nb_streams==0) {
+	&error("No host or result found !");
+	return 0;
+    }
+    print  ("Found ". keys(%performances) ." nodes, $nb_streams benchmark tests completed\n");
+    print  ("-\n");
+    print  ("Network Results:\n");
+    printf ("Cumulated bandwidth                : %7.2f Mbps\n",&sum(@global_results));
+    printf ("Average bandwidth / host           : %7.2f Mbps\n",&mean(@global_results));
+    printf ("Standard deviation between hosts   : %7.2f Mbps\n",&stddev(@global_results));
+    printf ("Average bandwidth / stream         : %7.2f Mbps\n",&sum(@global_results)/$nb_streams);
+    printf ("Standard deviation between streams : %7.2f \n",&stddev(@all_streams));
+    print  ("-\n");
+    print  ("CPU Results$cpuburn_text:\n");
+    printf ("Average cpu load / host            : %7.2f \%\n",&mean(@all_local_cpu));
+    printf ("Standard deviation between hosts   : %7.2f \n",&stddev(@all_local_cpu));
+    print  ("-\n");
+    printf ("Average network bandwidth / %%cpu   : %7.2f Mbps/%%cpu \n",&mean(@global_results) / &mean(@all_local_cpu));
+    print  ("-\n");
+    printf ("Individual Results:\n");
+    foreach $key (keys %results) {
+	print ("Node $key : \n");
+	printf (" |- %7.2f Mbps = $performances{$key}\n",$results{$key});
+	printf (" |- %7.2f %%cpu",$results_local_cpu{$key});
+	print ("\n");
+    }
+    print ("-\n");
+    print ("The CPU usage is reported for the processor where the test is binded, not for the whole system\n");
+    print ("This could not reflect the \"real\" cpu load of a SMP system\n");
+    return 1;
+}
+
+# Create a matrix between nodes's name and their associated port for netperf
+sub init_port_matrix{
+    my @nodes=@_;
+    my $port=$NETPERF_PORT_BASE;
+    foreach my $node (@nodes) {
+	$netperf_port{$node}=$port++;
+    }
+}
+
+# The storm bench procedure
+sub run_storm_bench {
+    my @nodes=@_;
+    &init_port_matrix(@nodes);
+    &stop_cpuburn_nodes(@nodes) if ($options{cpuburn});
+    &stop_netperf_servers(@nodes);
+    if (! &start_netperf_servers(@nodes)) {
+	&stop_netperf_servers(@nodes);
+	&error("Can't start all netperf servers, Exiting\n");
+	return 0;
+    }
+    &start_netperf_clients;
+    &stop_netperf_servers(@nodes);
+    return 1;
+}
+sub close_output_file {
+    close (OUTPUTFILE);
+    print "You're now able to graph using the following command : \n";
+    print "gnuplot <configfile> (usually called diag_network.gnuplot) \n";
+}
+
+sub prepare_output_file {
+    my @nodes=@_;
+    my $num_node_to=0;
+    open (OUTPUTFILE,"> $options{outputfile}") or die "Cannot open $options{outputfile} for writing ! \n";
+    foreach $mynode (@nodes) {
+	$num_node_to++;
+	print OUTPUTFILE "# node number $num_node_to is $mynode\n";
+    }
+}
+
+# Convert a Hostname to its IP address
+sub hostname_to_ip {
+    my ($name,$aliases,$type,$len,$ipaddr) = gethostbyname($_[0]);
+    # ipaddr is not readable directly, we must convert it to as string
+    my ($a,$b,$c,$d) = unpack('C4',$ipaddr);
+    return "$a.$b.$c.$d";
+}
+
+#Trying to find which node I'am from a list
+sub found_who_am_i {
+    my @nodes=@_;
+    foreach my $node (@nodes) {
+	my $ip_of_node=&hostname_to_ip($node);
+	next if ($ip_of_node == "..."); #No ip adress found for this host
+	my $status = system("`which ifconfig` | grep \"$ip_of_node \" >/dev/null 2>&1");
+	if ($status == 0) {
+	    return $node;
+	}
+    }
+    return undef;
+}
+
+# Count on localhost the number of burnP6 that runs
+sub count_cpuburn_instances {
+    my $instances =  `ps ax 2>/dev/null| grep $CPUBURN_TEST | grep -v grep | wc -l`;
+    chomp $instances;
+    return $instances;
+}
+
+# Kill the cpuburn instances on localhost
+sub stop_cpuburn {
+    print ("Cleaning " . &count_cpuburn_instances . " cpuburn instances\n");
+    system("killall -9 $CPUBURN_TEST >/dev/null 2>&1");
+}
+
+# Kill the cpuburn instances on some nodes
+sub stop_cpuburn_nodes {
+    my @nodes=@_;
+    print ("Cleaning cpuburn on nodes \n");
+    foreach my $node(@nodes) {
+	system("ssh root\@$node killall -9 $CPUBURN_TEST >/dev/null 2>&1");
+    }
+}
+
+# Start the server side of netpipe on each nodes
+sub start_netpipe_daemon {
+    my @nodes=@_;
+    print ("Starting netpipe (server side)\n");
+    foreach my $node(@nodes) {
+	system("ssh root\@$node \"killall -9 NPtcp >/dev/null 2>&1; nohup $NETPIPE $netpipe_socket_option $NETPIPE_BENCHMARK_OPTIONS >/dev/null 2>&1 &\"");
+    }
+}
+
+# Stop the server side of netpipe on each nodes
+sub stop_netpipe_daemon {
+    my @nodes=@_;
+    print ("Stopping netpipe (server side)\n");
+    foreach my $node(@nodes) {
+	system("ssh root\@$node \"killall -9 NPtcp >/dev/null 2>&1 \"");
+    }
+}
+
+# Start n*cpuburn on each nodes
+# n is the number of processors available on a node
+sub start_cpuburn_nodes {
+    my @nodes=@_;
+    foreach my $node(@nodes) {
+	my $nb_cpu=`ssh root\@$node /usr/bin/getconf _NPROCESSORS_ONLN`;
+	chomp $nb_cpu;
+	print ("Starting cpuburn on $node : $nb_cpu processor(s) \n");
+	for (my $loop=0; $loop<$nb_cpu; $loop++) {
+	    system("ssh root\@$node \"nohup $CPUBURN_TEST  >/dev/null 2>&1 &\"");
+	}
+    }
+}
+
+# Start n*cpuburn on localhost
+# n is the number of processors available
+sub start_cpuburn {
+    my $nb_cpu=`/usr/bin/getconf _NPROCESSORS_ONLN`;
+    chomp $nb_cpu;
+    my $nb_cpuburn_to_start = $nb_cpu - &count_cpuburn_instances;
+    print ("Starting cpuburn on $nb_cpu processor(s) \n");
+    for (my $loop=0; $loop<$nb_cpuburn_to_start; $loop++) {
+	`nohup $CPUBURN_TEST  >/dev/null 2>&1 &`;
+    }
+}
+
+# The main storm client procedure
+sub storm_client {
+    my @nodes=@_;
+    my $cmdline;
+    my $bandwidth;
+    my $cpu_local;
+    my $cpu_remote;
+    my $nb_test=0;
+    my $nb_other_hosts=0;
+    my $socket_text="";
+    my $socket_options="";
+
+    if ($options{"socket"}) {
+	    $socket_text=" using a socket size of ".$options{"socket"};
+	    $socket_options="-s ".$options{"socket"} . " -S ".$options{"socket"};
+	}
+
+    if ($options{packet}) {
+	$socket_options .= " -m " . $options{packet} . " -M " . $options{packet};
+	$socket_text   .= " Packet size = " . $options{packet};
+    }
+
+    &init_port_matrix(@nodes);
+    my $local_node=&found_who_am_i(@nodes);
+
+    if (! $local_node) {
+	&error("$hostname: I can't find myself in the node list (@nodes). Exiting");
+	return 0;
+    }
+    print ("$local_node is starting netperf client$socket_text for");
+    foreach my $other_node (grep { $_ ne $local_node } @nodes) {
+	print (" $other_node($netperf_port{$local_node})");
+	$nb_other_hosts++;
+	$cmdline .= " $NETPERF_CLIENT $NETPERF_CLIENT_OPTIONS -l $NETPERF_TIME_TO_RUN -n \`/usr/bin/getconf _NPROCESSORS_ONLN\` -H $other_node -p $netperf_port{$local_node} -t TCP_STREAM -- $socket_options &";
+    }
+    print "\n";
+
+    print "Starting benchmark$cpuburn_text, please wait for $NETPERF_TIME_TO_RUN seconds\n";
+    print "Running $cmdline\n";
+    open(NETPERF,"$cmdline 2>&1 |");
+    while (<NETPERF>) {
+	print "$_\n";
+	my ($recv_socket_size,$send_socket_size,$message_size,$time,$bp,$cpu_loc,$cpu_distant,$send_local,$send_remote) = $_ =~ /\s*(\d+)\s*(\d+)\s*(\d+)\s*(\d+\.\d+)\s*(\d+\.\d+)\s*(\d+\.\d+)\s*(\d+\.\d+)\s*(\d+\.\d+)\s*(\d+\.\d+).*/;
+	if ($bp) {
+	    $nb_tests_found++;
+	    push @bandwidth,$bp;
+	    $cpu_local=$cpu_loc;
+	    push @cpu_remote, $cpu_distant;
+	}
+    }
+    close(NETPERF);
+
+    if ($nb_tests_found != $nb_other_hosts) {
+	&error("$hostname: Only $nb_tests_found results found for $nb_other_hosts hosts\n");
+	&error("$hostname: Exiting\n");
+	return 0;
+    }
+
+    print ("Found $nb_tests_found/$nb_other_hosts bandwidth results \n");
+    print ("-\n");
+    print  ("Network Results:\n");
+    printf ("$local_node : Cumulated bandwidth : %7.2f Mb/sec\n",&sum(@bandwidth));
+    printf ("$local_node : Avergage bandwidth  : %7.2f Mb/sec\n",&mean(@bandwidth));
+    printf ("$local_node : Standard deviation   : %7.2f Mb/sec\n",&stddev(@bandwidth));
+    print  ("$local_node : Individual results  : @bandwidth \n");
+    print ("-\n");
+    print  ("CPU Results$cpuburn_text:\n");
+    printf ("$local_node : Local CPU Load  (%%) : %7.2f \n",$cpu_local);
+    printf ("$local_node : Avg. remote cpu (%%) : %7.2f \n",&mean(@cpu_remote));
+    printf ("$local_node : Std dev. remote cpu : %7.2f \n",&stddev(@cpu_remote));
+    print  ("$local_node : Remote CPU Load (%) : @cpu_remote \n");
+    print ("-\n");
+    print ("The CPU usage is reported for the processor where the test is binded, not for the whole system\n");
+    print ("This could not reflect the \"real\" cpu load of a SMP system\n");
+}
+
+sub storm {
+    my @nodes=@_;
+    &check_ssh_permissions("/usr/sbin/diag_network",@nodes);
+    &check_ssh_permissions($NETPERF_CLIENT,@nodes);
+    &check_ssh_permissions($NETPERF_SERVER,@nodes);
+    &check_ssh_permissions($KASH,@nodes);
+    &check_ssh_permissions($CPUBURN_TEST,@nodes) if ($options{cpuburn});
+    &run_storm_bench(@nodes);
+}
+
+sub netpipe {
+    my @nodes=@_;
+
+    &check_ssh_permissions($NETPIPE,@nodes);
+    &check_ssh_permissions($CPUBURN_TEST,@nodes) if ($options{cpuburn});
+    &prepare_output_file(@nodes) if $options{outputfile};
+    &run_netpipe_bench(@nodes);
+    &close_output_file if $options{outputfile};
+}
+
+# MAIN PROGRAM
+$ENV{LC_ALL} = "C";
+$|=1;
+
+$hostname=`hostname`;
+chomp $hostname;
+
+if (GetOptions(\%options,"help|h","outputfile|o=s","storm|s","clientstorm|I","cpuburn|c","time|t=n","debug|d","socket=s","packet=s","bidirect|b","no_integrity|i","nodes|n=s" => \@arg_nodes_list) == 0) {
+    print("Use `$0 --help' for more information.\n");
+    exit 1;
+}
+
+if ($options{help}) {
+    &usage;
+}
+
+if ($options{"time"}) {
+	$NETPERF_TIME_TO_RUN=$options{"time"};
+}
+
+if ($options{no_integrity}) {
+    $no_integrity=1;
+}
+
+if ($options{cpuburn}) {
+    $cpuburn_option="-c";
+    $cpuburn_text=" using cpuburn";
+}
+
+my $num_node_to=0;
+my $num_node_from=0;
+my @nodes_list; # The nodes name give by the command line
+# Let's extrapolate all -nodes calls to extract the node list from each
+# That's useful to add a node out of a pattern like in "-n node/1-10/ -n server1"
+foreach $nodes (map { "$_" } @arg_nodes_list) {
+	push(@nodes_list, &name_expand($nodes));
+}
+
+if (@nodes_list < 2 ) {
+    print("Bad number of arguments, you must specify at least a set of two nodes for this test\n");
+    print("Use `$0 --help' for more information.\n");
+    exit 1;
+}
+
+if ($options{storm}) {
+    if ($options{clientstorm}) {
+	&storm_client(@nodes_list);
+    }
+    else { &storm(@nodes_list);
+       }
+} else {
+    &netpipe(@nodes_list);
+}
+
+=pod
+
+=head1 NAME
+
+Benchmark the network between serveral hosts
+
+=head1 SYNOPSYS
+
+Runs a network bench on a set of nodes
+
+Usage : diag_network -n nodes [-s] [-S <socket_size><unit>] 		[-P <packet_size><unit>] [-t] [-b] [-c] [-o outputfile]
+
+=head1 OPTIONS
+
+-n, --nodes             Select a set of nodes to test
+
+-s, --storm       Using storm mode								
+-S, --socket      Define the buffer size of the socket				
+-P, --packet      Define the size of packets to send				
+		  By default the packet size equals the socket size		
+
+-t, --time        Define the time the storm bench duration			
+		  Option only available in storm mode					
+
+-b, --bidirect    Make a bi-directional network test				 
+		  Option not available in storm mode					
+
+-c, --cpuburn     Start the test under a high cpu load				
+		  Cpuburn simulates a high cpuload						
+
+-o, --outputfile  Select the outputfile, it could be used by gnuplot.
+		  (i.e diag_network.output)					
+		  Option not available in storm mode
+
+-i, --no_integrity	Don't do the integrity checking
+
+Units:
+For socket and packet options, units could be k,m,g,K,M,G
+
+K = Kilo
+M = Mega
+G = Giga
+
+Low case means that the number will be a power of 10				
+Upper case means that the number will be a power of 2				
+128k -> 128000												
+128K -> 131072								
+
+=head1 EXAMPLE
+
+diag_network -n node/1-6 								
+	#Testing all the network links between nodes node1,node2,node3,node4,node5,node6
+        
+diag_network -n node/1-6/ -s --socket 128k						
+	#Testing the nodes node/1-6/ in storm mode with a socket size of 128000 Bytes
+
+=head1 SEE ALSO
+
+exadiag_mcast(1)
+
+=head1 AUTHOR
+
+=cut
+
