@@ -1,0 +1,47 @@
+Checking ssh configuration & permissions for /usr/sbin/diag_network
+Checking ssh configuration & permissions for /usr/bin/netperf
+Checking ssh configuration & permissions for /usr/bin/netserver
+Checking ssh configuration & permissions for /usr/bin/kash
+Stopping netperf servers
+Starting netperf servers on m1sw1 for m1sw2 m2sw1 m2sw2 m1sw3
+Starting netperf servers on m1sw2 for m1sw1 m2sw1 m2sw2 m1sw3
+Starting netperf servers on m2sw1 for m1sw1 m1sw2 m2sw2 m1sw3
+Starting netperf servers on m2sw2 for m1sw1 m1sw2 m2sw1 m1sw3
+Starting netperf servers on m1sw3 for m1sw1 m1sw2 m2sw1 m2sw2
+Starting benchmark 
+Please wait for 90 seconds
+Found 5 nodes, 20 benchmark tests completed
+-
+Network Results:
+Cumulated bandwidth               : 37435.90 Mbps
+Average bandwidth / host          : 7487.18 Mbps
+Standard deviation between host    : 1302.14 Mbps
+Average bandwidth / stream        : 1871.79 Mbps
+Standard deviation between streams :  399.93 
+-
+CPU Results:
+Average cpu load / host           :    8.32 %
+Standard deviation between host    :    0.45 
+-
+Average network bandwidth / %cpu   :  900.12 Mbps/%cpu 
+-
+Individual Results:
+Node m2sw1  : 
+ |- 9406.85 Mbps =  2899.87 2345.53 2752.75 1408.70 
+ |-    8.65 %cpu
+Node m1sw1  : 
+ |- 7082.26 Mbps =  3277.30 1606.41 1237.47 961.08 
+ |-    8.40 %cpu
+Node m2sw2  : 
+ |- 7541.09 Mbps =  2681.84 722.12 1496.97 2640.16 
+ |-    8.56 %cpu
+Node m1sw2  : 
+ |- 5399.88 Mbps =  2130.34 782.12 1278.35 1209.07 
+ |-    8.55 %cpu
+Node m1sw3  : 
+ |- 8005.82 Mbps =  2375.47 1436.72 2824.24 1369.39 
+ |-    7.43 %cpu
+-
+The CPU usage is reported for the processor where the test is binded, not for the whole system
+This could not reflect the "real" cpu load of a SMP system
+Stopping netperf servers
